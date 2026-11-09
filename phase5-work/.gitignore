@@ -1,0 +1,36 @@
+*~
+_*
+*.o
+*.d
+*.asm
+*.sym
+*.img
+vectors.S
+bootblock
+entryother
+initcode
+initcode.out
+kernelmemfs
+mkfs/mkfs
+kernel/kernel
+user/usys.S
+.gdbinit
+TAGS
+
+# Phase 5 local dependency and bytecode caches; keep real test evidence.
+__pycache__/
+.tools/
+.pip-cache/
+.uv-cache/
+cs140-project1/
+verification/host/
+.policy-*
+verification/qemu-temp/
+
+# Review copies and commented proposals are not submission source.
+/review-phase4-v2/
+
+# Local generated verification output; retain runner_logs and results.
+verification/
+__pycache__/
+.policy-*

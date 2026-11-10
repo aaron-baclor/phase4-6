@@ -878,7 +878,7 @@ scheduler_tick(void)
       acquire(&g->lock);
       g->io_ticks++;
       release(&g->lock);
-    } else if(p->state == RUNNING){
+    } else if(p->state == RUNNING && !p->killed){
       p->cpu_ticks++;
       p->burst_consumed++;
       p->dispatch_erbt = -1;

@@ -77,6 +77,9 @@ usertrap(void)
     setkilled(p);
   }
 
+  if(scheduling_stcf() && which_dev == 2 && killed(p))
+    yield();
+
   if(killed(p))
     exit(-1);
 

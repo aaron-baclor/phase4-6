@@ -836,7 +836,7 @@ scheduler_tick(void)
 #ifdef SCHED_TEST_TRACE
       printf("TRACE|READY|%d|%u|%lu|%d\n", p->pid, read_current_tick(), p->tiq, stcf_erbt(p));
 #endif
-    } else if(p->state == RUNNING){
+    } else if(p->state == RUNNING && !p->killed){
       p->cpu_ticks++;
       p->burst_consumed++;
       p->dispatch_erbt = -1;

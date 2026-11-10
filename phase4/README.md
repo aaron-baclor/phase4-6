@@ -274,15 +274,6 @@ test cases that the course team has not published.
   for the Section 2.5 bookkeeping requirement.
 - `init` and `sh` are recognized for budget refresh by `initproc` and by the
   exact name `sh`, so any process named `sh` is also refreshed.
-
-## References and AI assistance
-
-- CS 140 Project 1 specification v2 (`CS_140_2627S1_Project1v2.pdf`).
-- MIT xv6-riscv source, on which this tree is based.
-- The consolidation of the two Phase 4 versions, the cleanup and this README
-  were prepared with the help of Claude Code (Anthropic) on 2026-11-10, and
-  reviewed by the group. AI use during earlier development of Phases 1–4
-  belongs in the group's `LLM Logs` folder (documentation item 2) and is not
   restated here.
 
 The original `README` file is the stock xv6 README that the Makefile packages

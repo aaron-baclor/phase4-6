@@ -274,7 +274,6 @@ test cases that the course team has not published.
   for the Section 2.5 bookkeeping requirement.
 - `init` and `sh` are recognized for budget refresh by `initproc` and by the
   exact name `sh`, so any process named `sh` is also refreshed.
-  restated here.
 
 The original `README` file is the stock xv6 README that the Makefile packages
 into `fs.img`. It is intentionally left unchanged.

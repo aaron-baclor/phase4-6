@@ -1,4 +1,4 @@
-# Phase 5 — Two-Tier Grouped STCF (dynamic grouping)
+# Phase 5
 
 ## Group members
 
@@ -8,216 +8,376 @@
 - MALAGAR, Juan Antonio Miguel M. - 2022-05081 - THY
 - ORFIANO, Zachary Claude N. - 2020-11220 - THY
 
-## Running
+## What we added
 
-```sh
-CPUS=1 make qemu                                 # default: vanilla xv6 round robin (RR)
-CPUS=1 make qemu SCHEDULING_POLICY=STCF          # single-tier STCF with aging
-CPUS=1 make qemu SCHEDULING_POLICY=GROUP_STCF    # two-tier grouped STCF
-```
+We added dynamic process groups and configurable shares, keeping
+the process counters, preemption, aging, and grouped scheduling
+from the earlier phases.
 
-Test and analysis commands (Section 4.3), run from this directory:
+RR is still the default policy. STCF picks the runnable process
+with the smallest effective remaining burst time across the whole
+process table.
 
-```sh
-uv venv cs140-project1
-source cs140-project1/bin/activate
-uv pip install -r requirements.txt
-./sanity_check.sh
-N=20 ./runner.sh
-python3 results.py
-```
+When GROUP_STCF is selected, the scheduler first picks an eligible
+group with the lowest virtual runtime. A group is eligible if it
+has at least one runnable process. If two groups have the same
+virtual runtime at the stored comparison precision, the lower
+group ID goes first.
 
-If `uv` is unavailable, `python3 -m venv cs140-project1` followed by
-`pip install -r requirements.txt` is equivalent. The scripts also need GNU
-Make, host `gcc`, a RISC-V GCC toolchain and `qemu-system-riscv64`.
+The scheduler then picks the runnable process in that group with
+the smallest effective remaining burst time. If two processes
+have the same value, the older process goes first. If their
+creation ticks are also equal, the lower PID goes first.
 
-## What Phase 5 adds
+There are eight groups, each starting with 100 shares. Init starts
+in Group 0. An ordinary fork() child inherits its parent's group,
+replacing the earlier pid % N_GROUPS assignment.
 
-Phase 5 builds on the consolidated Phase 4 implementation (see `phase4/`)
-and changes the following (Section 4.1.5):
+We added setgroup() to move the calling process to another group,
+groupfork() to create a child directly in a chosen group, and
+setshares() to change a group's shares.
 
-- `N_GROUPS` is 8. Every group still starts with `DEFAULT_SHARES = 100`.
-- The static `pid % N_GROUPS` assignment is removed. `init` starts in Group 0
-  and every child inherits its parent's group, unless it was created with
-  `groupfork()` or later moves with `setgroup()`. `exec()` keeps the group.
-- New system calls:
-  - `setgroup(gid)` (#25): moves the caller to `gid`.
-  - `groupfork(gid)` (#26): `fork()`, with the child placed directly in `gid`
-    before it becomes RUNNABLE.
-  - `setshares(gid, shares)` (#27): changes a group's weight, then calls
-    `yield()`.
-- Invalid `gid` in `setgroup`/`groupfork` (outside 0–7) marks the caller
-  killed and returns -1, so the caller exits with status -1 before reaching
-  user code. `setshares` returns -1 for an invalid `gid` or `shares <= 0`
-  without killing the caller (Sections 3.4–3.6).
+Calling exec() keeps the process's group. Automatic shares
+boosting is not implemented in this phase.
 
-Unchanged from Phases 1–4: the per-process tracking, STCF selection with ERBT
-aging and `dispatch_erbt`, `setburst`, budget kills with `init`/`sh` refresh,
-two-tier selection and preemption with lower-ID group ties, the grouped
-schedlog format, the untouched RR scheduler and the boot-time policy message.
+## Process counters and budgets
 
-## Implementation notes
+Each process starts with a default budget of 100 ticks.
 
-### Group membership and counts
+We added fields for:
 
-`fork()` and `groupfork()` share `fork_into_group(gid)`. It sets `np->gid`
-while the child is still `USED` and invisible to the scheduler, so the child's
-first dispatch already happens in the right group. `fork()` reads the parent's
-`gid` under the parent's lock.
+- Creation tick
+- Total burst budget
+- Remaining burst budget
+- Ticks consumed from the current budget
+- Lifetime CPU ticks
+- Lifetime ticks spent runnable and waiting
+- Time in the ready queue for aging
+- Effective remaining burst saved when selected
+- Group ID
 
-`proc_setstate()` is now the single place where a process enters or leaves
-the RUNNABLE/RUNNING set. It adjusts the group's `run_procs` under the group
-lock while the caller holds the process lock. `userinit()`, `fork`,
-`scheduler()`, `yield()`, `sleep()`, `wakeup()`, `kill()` and `exit()` all go
-through it, replacing the hand-written increments and decrements of Phase 4.
+Running processes gain CPU ticks, while runnable processes gain
+ready ticks and time in the ready queue. Sleeping processes gain
+neither.
 
-`proc_setgroup()` moves the caller's `run_procs` contribution between the old
-and new groups while holding both group locks, always taken in ascending ID
-order. Past CPU charges stay with the group that consumed them. Moving
-neither resets nor transfers virtual runtime.
+Sleeping, ordinary yields, and preemption keep the remaining budget.
+Calling setburst() replaces the budget and resets its consumed
+ticks, but keeps the lifetime counters.
 
-### Virtual runtime with changeable shares
+Under STCF and GROUP_STCF, ordinary processes are marked killed
+when their budget runs out. Init and processes named exactly sh
+receive a fresh budget so the system and shell can keep running.
 
-Every charged CPU tick adds exactly `1024 / shares` to the running group's
-virtual runtime. The integer part is in `vruntime`. The remainder is carried
-as a 32-bit fixed-point fraction (`vruntime_frac`) plus the division residue
-(`vruntime_rem`), so no precision is lost even for shares above 1024. While a
-group's shares stay constant, `vruntime` equals
-`floor(total_ticks * 1024 / shares)`, which is exactly Equation 2.
+RR keeps its normal timer-based switching and does not kill
+processes for running out of budget.
 
-When `setshares` changes the weight, only future ticks are charged at the new
-rate. Accumulated virtual runtime is kept, as Section 2.5 requires ("maintained
-and never reset"), and it never jumps up or down. The course team confirmed
-both points on the forum thread "[Phase 5] Effect of setshares() on
-accumulated group vruntime" (2026-11-09/10): "The new shares would apply to
-future CPU ticks", and fractional increments must be stored and taken into
-account rather than rounded off. Group comparisons (`find_lowest_gid()`,
-`stcf_should_preempt()`) compare `vruntime`, then `vruntime_frac`, then the
-group ID.
+Pressing Ctrl+P shows the process list with the added counters.
 
-schedlog prints vruntime with exactly two decimal places, as the same thread
-requires: the whole part, then the hundredths truncated from
-`vruntime_frac`. For example, one tick at 100 shares prints `10.24`, and one
-tick at 300 shares prints `3.41`.
+## Aging and preemption
 
-### Locking
+We keep aging from Phase 3. For every STCF_AT ticks a process
+waits in the ready queue, its effective remaining burst is reduced
+by STCF_AD. Both constants are 20.
 
-Lock order is process lock → group lock. `proc_setgroup()` is the only place
-that holds two group locks, and it takes them in ascending ID order. No group
-lock is held across `swtch()`. `setshares` releases the group lock before
-`yield()`.
+The effective remaining burst cannot go below zero. Aging changes
+the value used for scheduling, without changing the actual
+remaining budget.
 
-## Code changes (per file)
+The ready-queue aging counter resets when the process is selected.
+We save its selected effective remaining burst in dispatch_erbt
+until its first CPU tick. This prevents the reset from immediately
+taking away the priority it earned while waiting.
 
-Changes since Phase 4:
+Under STCF, the running process yields when another runnable
+process has a smaller effective remaining burst.
 
-- `kernel/stcf.h`: `N_GROUPS 8`; `VRUNTIME_SCALE` (fixed-point scale).
-- `kernel/proc.h`: `struct group` gains `vruntime_frac` and `vruntime_rem`.
-- `kernel/proc.c`:
-  - new `proc_setstate()`, used for every state transition that affects
-    `run_procs`
-  - `allocproc()`: no more `pid % N_GROUPS`; `userinit()` places `init` in
-    Group 0
-  - `fork()` → `fork_into_group(parent gid)`; new `groupfork(gid)`
-  - new `proc_setgroup()` and `proc_setshares()`
-  - `scheduler_tick()`: incremental fractional `vruntime`
-  - `find_lowest_gid()`, `stcf_should_preempt()`: fraction-aware comparison
-  - `schedlog_emit()`: vruntime printed with two decimal places
-- `kernel/defs.h`: declares `proc_setgroup`, `groupfork`, `proc_setshares`.
-- `kernel/syscall.h`: `SYS_setgroup 25`, `SYS_groupfork 26`,
-  `SYS_setshares 27`.
-- `kernel/syscall.c`, `kernel/sysproc.c`: `sys_setgroup`, `sys_groupfork`,
-  `sys_setshares`.
-- `user/user.h`, `user/usys.pl`: user stubs for the three new syscalls.
-- `Makefile`: installs `test_sched` (replacing `test_phase4`) and
-  `test_group_sh`.
+Under GROUP_STCF, it yields when another eligible group has a
+lower virtual runtime, or an equal value at the stored comparison
+precision with a lower group ID. It also yields when a runnable
+process in its own group has a smaller effective remaining burst.
 
-Inherited from Phases 1–4 and unchanged here: `kernel/param.h`,
-`kernel/main.c`, `kernel/trap.c`, the schedlog/setburst plumbing,
-`mkfs/mkfs.c`. See `phase4/README.md` for those changes.
+An equal effective remaining burst does not trigger process-level
+preemption. Process tie-breaking rules apply when the scheduler
+selects between runnable processes.
 
-## Test programs and scripts
+We check for preemption before returning to user code after
+handling a syscall or trap, and after handling interrupts during
+kernel work.
 
-All scripts force `CPUS=1` (Section 4.3).
+## Group counters and shares
 
-- `user/workload.h`, `user/test_cpu.c`, `user/test_io.c`, `user/test_f_cpu.c`,
-  `user/test_f_io.c`, `user/test_bg.c`: the Section 4.3.1 workloads (shared
-  helper, CPU-bound, I/O-bound with `sleep(4)`, fork-intensive CPU and I/O,
-  CPU/sleep alternation). All run in the shell's group (Group 0).
-- `user/test_group_iso.c`: uses `groupfork(1)` for a parent that floods
-  Group 1 with 12 short (burst 10) workers, and `groupfork(2)` for one long
-  worker. It shows that the flood cannot starve Group 2.
-- `user/test_group_sh.c`: sets shares to 100 (Group 1) and 300 (Group 2),
-  runs one CPU-bound worker in each, prints `SHARES_CHANGE|<tick>` after 16
-  ticks, swaps the shares to 300:100, and runs until tick 32. The validator
-  checks that the group with three times the shares receives at least twice
-  the CPU ticks both before and after the swap (Section 4.3.1 item 7).
-- `user/test_sched.c`: in-guest probes. Fatal validation (`setburst(0/-1)`,
-  `setgroup(-1/8)`, `groupfork(-1/8)` → exit status -1). `setshares`
-  validation, with the caller surviving. Inheritance, direct `groupfork`
-  placement, and membership surviving `exec`. Budget exhaustion. schedlog
-  window semantics. Wakeup preemption (`preempt`) and starvation
-  mitigation (`aging`).
-- `sanity_check.sh` / `sanity_check.py`: parser unit tests and host checks,
-  then per policy: `test_sched`, `echo`, `forktest`, and (STCF policies)
-  `preempt`/`aging`. It checks exhaustion status, aged-release timing, that
-  the woken short job is charged a tick right away, exact schedlog format, and
-  that every `MEMBER|pid|gid` claim matches the group the process appears
-  under in schedlog and its first dispatch.
-- `tests/host_checks.py` / `tests/host_checks.c`: compile the real
-  `proc.c` scheduler functions on the host against lock-order-checking stubs.
-  The checks cover state counts and migration, two-tier eligibility and ties,
-  ERBT boundaries, preemption (including the equal-vruntime regression),
-  `setshares` validation, yield and history, extreme shares, budget death,
-  RR/shell guards, fractional vruntime, and schedlog.
-- `tests/qemu_tools.py`, `tests/test_log_parser.py`,
-  `tests/fixtures/interleaved-console.log`: guest driver, log parser and its
-  regression tests.
-- `runner.sh` / `tests/run_workloads.py`: `N` (default 10) runs of each of the
-  7 programs under RR, STCF and GROUP_STCF, grouped per program
-  (`runner_logs/<program>/<policy>/run-NN.log`). Optional `JOBS=k` runs
-  parallel isolated guests. It finishes with `tests/validate_workloads.py`:
-  format, monotonic vruntime, isolation progress and the shares ratios
-  described above.
-- `results.py`: writes nine plots, `results/phase5_<policy>_<metric>.png`
-  (context switches, response time and turnaround × 3 policies, each with all 7
-  programs), plus `results/summary.csv`. The metric definitions are as in
-  Phase 4.
-- `tests/show_evidence.py`: prints log excerpts for the documentation
-  screenshots. The `shares`, `isolation` and `host` topics expect the
-  runner/sanity console output saved as `workload-checks.log` and
-  `sanity-summary.log` in this directory.
+Each group tracks:
 
-## Testing performed
+- Shares
+- Number of runnable and running processes
+- Total CPU ticks used by its processes
+- Whole and fractional virtual runtime
+- Remainder from the virtual runtime calculation
 
-All results below were produced on 2026-11-10 in this directory, with GNU
-Make, `riscv64-elf-gcc`, QEMU 11.1 and Python 3.14 with `pexpect` and
-`matplotlib`.
+The group's ID is its position in the group array.
 
-| Check | Result |
-|---|---|
-| `./sanity_check.sh` (clean build of RR, STCF, GROUP_STCF; `CPUS=1`) | PASS: 5/5 parser tests (including the two-decimal vruntime check), host checks (17,232 assertions, including the two-decimal printing check), all in-guest probes under all three policies, including fatal validation, inheritance, `groupfork` placement and exec preservation |
-| `N=20 JOBS=2 ./runner.sh` (7 programs × 3 policies × 20 runs = 420 guest runs) | PASS: 420/420 runs; `validate_workloads.py` passed for all 140 GROUP_STCF logs. Isolation passed 20/20. Shares passed 20/20, e.g. run-01: Group 1:2 CPU ticks 5:14 at 100:300 shares, then 9:3 after the swap to 300:100 |
-| `python3 results.py` | PASS: nine plots and `results/summary.csv` |
-| Stock `usertests -q`, RR, `CPUS=3` | PASS: `ALL TESTS PASSED` |
-| `CPUS=3` smoke test under STCF and GROUP_STCF (`test_sched`, `forktest`, `test_f_cpu`, `test_f_io`, `test_group_iso`, `test_group_sh`) | PASS: no panic or hang |
-| Non-TRACE build schedlog check (`test_f_io`) | PASS: exact format with two-decimal vruntime (e.g. `13.65` at 300 shares), groups 0–7 in order, no `TRACE` output |
+Each CPU tick adds 1024 / shares to the running group's virtual
+runtime. A group with more shares gains virtual runtime more
+slowly, giving it more opportunities to run under GROUP_STCF.
 
-`runner_logs/` holds the 420 logs. `results/` holds the plots generated from
-them.
+We keep fractional values so a tick's charge is not rounded down
+to a whole number. Group comparisons check the whole virtual
+runtime, then its stored fractional part, then the group ID.
 
-Not tested: real hardware; `CPUS>1` beyond the smoke runs listed; grading
-test cases that the course team has not published.
+Changing shares affects future CPU charges. It does not recalculate
+all earlier CPU ticks using the new shares. The whole and stored
+fractional virtual runtime are kept, while the division remainder
+is rescaled using integer arithmetic.
 
-## Known limitations
+Group CPU ticks and virtual runtime are kept even when the group
+has no runnable or running processes.
 
-- Committed evidence and the harness use `CPUS=1` (Section 4.3). Multi-CPU
-  runs were only smoke-tested.
-- The printed hundredths are truncated, not rounded; the forum only said
-  "two decimal places". The two methods differ only when `1024 / shares` has
-  more than two decimals (for example, 300 shares). The scheduler itself
-  compares the full-precision value.
-- `setgroup()` does not yield. A move into a group with lower virtual runtime
-  takes effect at the next trap's preemption check, at most one tick later.
+Moving a process updates the runnable and running counts of the
+old and new groups. Past CPU charges stay with the group that
+used them. Moving does not transfer or reset group virtual runtime.
 
+proc_setstate() updates the group count when a process enters
+or leaves the runnable and running states.
 
+When both locks are needed, we take the process lock before the
+group lock. Moving between groups takes both group locks in
+ascending group ID order. Group locks are released before
+switching processes.
+
+## System calls
+
+### setburst(int ticks)
+
+System call number: 24.
+
+A positive value sets the calling process's total and remaining
+budget to that value, clears its current consumed ticks, and yields
+so the scheduler can pick again. It also clears the saved
+dispatch_erbt value.
+
+A zero or negative value marks the caller killed.
+
+### schedlog(int ticks)
+
+System call number: 23.
+
+A positive value starts a shared logging window for that many ticks.
+Calling it again replaces the current window. Zero stops logging,
+and a negative value returns -1.
+
+While the window is active, the scheduler prints the process
+information before switching to a process. The selected process
+is already marked RUNNING when the entry is printed.
+
+Under GROUP_STCF, it prints one GROUP line for each of the eight
+groups in group ID order. Each line includes the group's shares,
+virtual runtime, and processes that are not UNUSED.
+
+Virtual runtime is printed with two decimal places, truncated
+rather than rounded. For example, one CPU tick at 100 shares
+prints 10.24, while one tick at 300 shares prints 3.41.
+
+RR and STCF keep the earlier single-line format with STCF in
+the prefix and 0(0,0) as the group information.
+
+The state numbers are:
+
+- USED: 1
+- SLEEPING: 2
+- RUNNABLE: 3
+- RUNNING: 4
+- ZOMBIE: 5
+
+### setgroup(int gid)
+
+System call number: 25.
+
+Moves the calling process to the chosen group. Valid group IDs
+are 0 to 7. Choosing the current group leaves it unchanged.
+
+An invalid group ID marks the caller killed. The caller exits
+with status -1 before returning to user code.
+
+Changing groups keeps the process's budget and counters.
+setgroup() does not directly call yield(); the trap return path
+checks whether the process should be preempted.
+
+### groupfork(int gid)
+
+System call number: 26.
+
+Creates a child in the chosen group. The child is assigned its
+group before it becomes runnable, so its first execution already
+happens in that group.
+
+Like fork(), it returns the child's PID to the parent and 0
+to the child. An allocation failure returns -1 to the parent.
+
+Valid group IDs are 0 to 7. An invalid group ID marks the caller
+killed before a child is allocated.
+
+The parent's group does not change.
+
+### setshares(int gid, int shares)
+
+System call number: 27.
+
+Changes the chosen group's shares and yields so the scheduler
+can pick again. The new shares affect future virtual-runtime
+charges.
+
+Valid group IDs are 0 to 7, and shares must be positive.
+An invalid argument returns -1 without killing the caller.
+A successful call returns 0.
+
+The existing shutdown system call keeps number 22.
+
+## Code changes
+
+This list covers the cumulative scheduler changes and supporting
+files from the provided xv6 starter included in this branch.
+
+- `.gitignore`: Changed the mkfs ignore rule to ignore only the
+  compiled binary, so its source can be committed. Also excludes
+  compiled files and local test outputs.
+
+- `mkfs/mkfs.c`: Added the missing filesystem image builder source
+  from the provided mkfs archive.
+
+- `Makefile`: Added a default target that builds the kernel and
+  filesystem image, the scheduling policy option, and automatic
+  rebuilding when the policy or tracing option changes. Supports
+  RR, STCF, and GROUP_STCF. Added the test programs, shared workload
+  header dependency, and RISC-V architecture flags. Replaced
+  test_phase4 with test_sched and added test_group_sh.
+
+- `kernel/stcf.h`: Added the default burst, aging constants,
+  N_GROUPS set to 8, DEFAULT_SHARES set to 100, and the scale
+  used for fractional virtual runtime.
+
+- `kernel/param.h`: Included stcf.h and used RR when no policy
+  is specified.
+
+- `kernel/main.c`: Added the selected policy to the boot output.
+
+- `kernel/proc.h`: Added the process budget, creation tick,
+  lifetime counters, aging counter, saved dispatch ERBT, and
+  group ID. Added the group structure for shares, runnable and
+  running counts, CPU ticks, and virtual runtime. Added fields
+  for fractional virtual runtime and its division remainder.
+
+- `kernel/proc.c`: Added policy setup, counter initialization and
+  cleanup, process selection, tick accounting, budget handling,
+  syscall helpers, scheduler logging, and the extra Ctrl+P output.
+  Added aging, saved dispatch ERBT, group-first selection, and
+  group-aware preemption. Replaced static group assignment with
+  parent-group inheritance. Added fork_into_group(), groupfork(),
+  proc_setgroup(), and proc_setshares(). Added proc_setstate()
+  for group count updates and fractional virtual-runtime
+  accounting for changing shares. Added optional TRACE output
+  for testing. Kept the RR process-table traversal.
+
+- `kernel/trap.c`: Added tick accounting before waking sleepers.
+  Added preemption checks in usertrap() and kerneltrap() for STCF
+  and GROUP_STCF. Added another killed-process check after a
+  possible yield in usertrap(). Kept normal timer switching for RR.
+
+- `kernel/defs.h`: Added declarations for the scheduler and syscall
+  helpers, including stcf_should_preempt(), proc_setgroup(),
+  groupfork(), and proc_setshares().
+
+- `kernel/syscall.h`: Added the numbers for schedlog, setburst,
+  setgroup, groupfork, and setshares.
+
+- `kernel/syscall.c`: Connected the new syscall numbers to
+  their handlers.
+
+- `kernel/sysproc.c`: Added handlers that read the syscall
+  arguments and call the helpers in proc.c.
+
+- `user/user.h`: Added the user-side declarations for schedlog,
+  setburst, setgroup, groupfork, and setshares.
+
+- `user/usys.pl`: Added entries to generate the new syscall stubs.
+
+- `user/workload.h`: Added shared helpers for computation,
+  workload identification, budgets, and logging.
+
+- `user/test_cpu.c`: Added a CPU-bound workload.
+
+- `user/test_io.c`: Added a workload that alternates short
+  computations with sleep calls.
+
+- `user/test_f_cpu.c`: Added a workload with four CPU-bound
+  children.
+
+- `user/test_f_io.c`: Added a workload with four children that
+  alternate computation and sleep.
+
+- `user/test_bg.c`: Added a workload that alternates longer
+  computations with short sleeps.
+
+- `user/test_group_iso.c`: Uses groupfork() to place many short
+  processes in Group 1 and a long process in Group 2, checking
+  that Group 2 still receives CPU time.
+
+- `user/test_group_sh.c`: Runs CPU workers in Groups 1 and 2 with
+  shares of 100 and 300, then swaps their shares to check how
+  CPU allocation changes.
+
+- `user/test_sched.c`: Added checks for syscall arguments,
+  group inheritance, groupfork placement, group preservation
+  across exec, budgets, preemption, aging, and scheduler logging.
+  Replaces the earlier test_phase4 program.
+
+- `sanity_check.sh`: Runs the sanity checks with one virtual CPU.
+
+- `sanity_check.py`: Runs the log parser tests, host checks,
+  and xv6 checks under RR, STCF, and GROUP_STCF.
+
+- `tests/__init__.py`: Makes the test helpers importable as
+  a Python package.
+
+- `tests/host_checks.py`: Extracts scheduler functions from proc.c
+  and compiles them for testing on the host.
+
+- `tests/host_checks.c`: Checks selection, preemption, aging,
+  group counts and movement, locking, logging, budgets, shares,
+  and fractional virtual runtime.
+
+- `tests/qemu_tools.py`: Starts QEMU sessions, runs commands,
+  and reads scheduler logs.
+
+- `tests/test_log_parser.py`: Checks that the parser handles
+  scheduler logs and interleaved console output correctly.
+
+- `tests/fixtures/interleaved-console.log`: Added sample output
+  used by the log parser tests.
+
+- `runner.sh`: Starts the workload runs. Uses 10 repetitions
+  by default, or the value supplied through N.
+
+- `tests/run_workloads.py`: Runs the workloads under each policy
+  and saves the logs by workload, policy, and repetition.
+
+- `tests/validate_workloads.py`: Checks the log format, group
+  membership, virtual runtime, progress between groups, and
+  CPU allocation before and after changing shares.
+
+- `tests/show_evidence.py`: Prints saved log excerpts for the
+  documentation screenshots.
+
+- `requirements.txt`: Lists the Python packages used by the
+  test and plotting scripts.
+
+- `results.py`: Reads the workload logs and creates nine plots
+  covering context switches, response time, and turnaround time
+  under the three policies. Also creates a summary CSV.
+
+- `runner_logs/`: Added 420 workload logs from seven workloads,
+  three policies, and 20 repetitions.
+
+- `results/`: Added the generated plots and summary CSV.
+
+- `README.md`: Added the group members, Phase 5 behavior, and
+  explanations of the cumulative code changes from the starter.

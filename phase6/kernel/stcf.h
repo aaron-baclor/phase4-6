@@ -11,6 +11,7 @@
 // Phase 5, Section 4.1.5: dynamic membership uses eight groups.
 #define N_GROUPS 8
 #define DEFAULT_SHARES 100
+// Phase 6, Section 4.1.6: dynamic shares boosting.
 #define SHARES_BOOSTING_RATIO 2
 #define BOOSTED_SHARES 200
 #define SHARES_BOOSTING_INTERVAL 10

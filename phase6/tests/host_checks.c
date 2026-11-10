@@ -215,8 +215,8 @@ int main(void)
   strcpy(current->name, "worker");
   CHECK(proc_schedlog(2) == 0);
   acquire(&current->lock); schedlog_emit(current); release(&current->lock);
-  CHECK(strstr(log_output, "102|GROUP|0(100,256),[1]worker:4(9975,25)\n") != 0);
-  CHECK(strstr(log_output, "102|GROUP|7(100,0)\n") != 0);
+  CHECK(strstr(log_output, "102|GROUP|0(100,256.00),[1]worker:4(9975,25)\n") != 0);
+  CHECK(strstr(log_output, "102|GROUP|7(100,0.00)\n") != 0);
   int length = log_length;
   ticks = 104;
   acquire(&current->lock); schedlog_emit(current); release(&current->lock);
@@ -225,6 +225,24 @@ int main(void)
   acquire(&current->lock); schedlog_emit(current); release(&current->lock);
   CHECK(strstr(log_output, "105|STCF|0(0,0),[1]worker:4(9975,25)\n") != 0);
   puts("PASS: fractional runtime, log replacement/stop/negative validation");
+  // Forum clarification: two printed decimals must include the division
+  // residue (1 tick at 100 shares is 10.24, not 10.23; at 300 it is 3.41).
+  reset(); ready(0, 0, 10000, 0); ready(1, 1, 10000, 0); group[1].shares = 300;
+  acquire(&current->lock); proc_setstate(current, RUNNING); release(&current->lock);
+  scheduler_tick();
+  current = &proc[1];
+  acquire(&proc[0].lock); proc_setstate(&proc[0], RUNNABLE); release(&proc[0].lock);
+  acquire(&current->lock); proc_setstate(current, RUNNING); release(&current->lock);
+  for(int i = 0; i < 3; i++) scheduler_tick();
+  log_length = 0; log_output[0] = 0; ticks = 200; proc_schedlog(5);
+  acquire(&current->lock); schedlog_emit(current); release(&current->lock);
+  CHECK(strstr(log_output, "200|GROUP|0(100,10.24)") != 0);
+  CHECK(strstr(log_output, "200|GROUP|1(300,10.24)") != 0);   // 3 * 1024/300
+  ticks = 201; scheduler_tick();   // off the Phase 6 boosting interval
+  log_length = 0; log_output[0] = 0;
+  acquire(&current->lock); schedlog_emit(current); release(&current->lock);
+  CHECK(strstr(log_output, "|GROUP|1(300,13.65)") != 0);      // 4 * 1024/300 = 13.653
+  puts("PASS: two-decimal vruntime printing includes the division residue");
 
   // Sections 2.3, 2.5: a group-runtime tie must not hide a shorter local job.
   reset(); ready(0, 2, 50, 1); ready(1, 2, 10, 2); ready(2, 1, 1000, 3);
@@ -250,15 +268,56 @@ int main(void)
   acquire(&proc[1].lock); proc_setstate(&proc[1], ZOMBIE); release(&proc[1].lock);
   group[1].io_ticks = 0;
   ticks = 40; scheduler_tick(); CHECK(group[1].shares == 100);
+  // An all-sleeping group keeps accumulating between checks; the interval
+  // decides with that I/O first and only then clears the idle group's history.
   group[1].io_ticks = 100;
   acquire(&proc[0].lock); proc_setstate(&proc[0], SLEEPING); release(&proc[0].lock);
-  ticks = 41; scheduler_tick(); CHECK(group[1].io_ticks == 0);
+  CHECK(group[1].run_procs == 0);
+  ticks = 41; scheduler_tick(); CHECK(group[1].io_ticks == 101);
+  ticks = 50; scheduler_tick();
+  CHECK(group[1].shares == 200 && group[1].io_ticks == 0);
   CHECK(group[1].vruntime == history);
   ready(2, 1, 1000, 0);
   for(int policy = 0; policy < 2; policy++){
     stcf_policy = policy; group[1].shares = 300;
-    ticks = 50; scheduler_tick(); CHECK(group[1].shares == 300);
+    ticks = 60; scheduler_tick(); CHECK(group[1].shares == 300);
   }
   puts("PASS: Phase 6 interval, inclusive ratio, restore, zero CPU, idle reset and policy guards");
+
+  // Regression: a lone sleep(n) process must be able to earn a boost. The old
+  // per-tick idle reset cleared its I/O every tick, so it never qualified.
+  reset(); ready(0, 3, 1000, 0);
+  group[3].total_ticks = 4;
+  acquire(&proc[0].lock); proc_setstate(&proc[0], SLEEPING); release(&proc[0].lock);
+  proc[0].chan = &ticks;
+  for(ticks = 11; ticks <= 20; ticks++) scheduler_tick();
+  CHECK(group[3].shares == BOOSTED_SHARES && group[3].io_ticks == 0);
+  CHECK(group[3].total_ticks == 4);
+
+  // Regression: a parent blocked in wait() (chan == itself) is not doing I/O,
+  // so CPU-bound children in its group must not be boosted by it.
+  reset(); ready(0, 4, 1000, 0); ready(1, 4, 1000, 0); ready(2, 4, 1000, 0);
+  acquire(&proc[0].lock); proc_setstate(&proc[0], SLEEPING); release(&proc[0].lock);
+  proc[0].chan = &proc[0];
+  acquire(&proc[1].lock); proc_setstate(&proc[1], SLEEPING); release(&proc[1].lock);
+  proc[1].chan = &proc[1];
+  current = &proc[2];
+  acquire(&proc[2].lock); proc_setstate(&proc[2], RUNNING); release(&proc[2].lock);
+  for(ticks = 11; ticks <= 20; ticks++) scheduler_tick();
+  CHECK(group[4].io_ticks == 0 && group[4].total_ticks == 10);
+  CHECK(group[4].shares == DEFAULT_SHARES);
+  // The same group sleeping on I/O instead (pipe/console/sleep) is boosted.
+  proc[0].chan = &ticks; proc[1].chan = &ticks;
+  for(ticks = 21; ticks <= 30; ticks++) scheduler_tick();
+  CHECK(group[4].io_ticks == 20 && group[4].total_ticks == 20);
+  CHECK(group[4].shares == DEFAULT_SHARES);       // 20 < 2 * 20
+  for(ticks = 31; ticks <= 40; ticks++) scheduler_tick();
+  CHECK(group[4].io_ticks == 40 && group[4].total_ticks == 30);
+  CHECK(group[4].shares == DEFAULT_SHARES);       // 40 < 2 * 30
+  acquire(&proc[2].lock); proc_setstate(&proc[2], RUNNABLE); release(&proc[2].lock);
+  for(ticks = 41; ticks <= 50; ticks++) scheduler_tick();
+  CHECK(group[4].io_ticks == 60 && group[4].total_ticks == 30);
+  CHECK(group[4].shares == BOOSTED_SHARES);       // 60 >= 2 * 30
+  puts("PASS: Phase 6 lone-sleeper boost and wait() exclusion regressions");
   return 0;
 }

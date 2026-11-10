@@ -870,7 +870,10 @@ scheduler_tick(void)
 #ifdef SCHED_TEST_TRACE
       printf("TRACE|READY|%d|%u|%lu|%d\n", p->pid, read_current_tick(), p->tiq, stcf_erbt(p));
 #endif
-    } else if(p->state == SLEEPING){
+    } else if(p->state == SLEEPING && p->chan != p){
+      // Section 4.1.6: a blocked tick is an I/O tick, so sleep(n) adds n.
+      // wait() sleeps on the parent itself (chan == p); waiting for a child
+      // is not I/O and would otherwise boost CPU-bound fork workloads.
       g = &group[p->gid];
       acquire(&g->lock);
       g->io_ticks++;
@@ -914,21 +917,31 @@ scheduler_tick(void)
     release(&p->lock);
   }
 
+  // Section 4.1.6: shares boosting runs once every SHARES_BOOSTING_INTERVAL.
+  if(read_current_tick() % SHARES_BOOSTING_INTERVAL != 0)
+    return;
+
   for(int i = 0; i < N_GROUPS; i++){
     struct group *g = &group[i];
     acquire(&g->lock);
-    if(g->run_procs == 0)
-      g->io_ticks = 0;
-    if(stcf_policy == 2 && read_current_tick() % SHARES_BOOSTING_INTERVAL == 0){
-      int shares = DEFAULT_SHARES;
-      // integer division avoids overflow and keeps the threshold inclusive
-      if(g->io_ticks > 0 &&
-         (g->total_ticks == 0 ||
-          g->io_ticks / SHARES_BOOSTING_RATIO >= g->total_ticks))
-        shares = BOOSTED_SHARES;
+    if(stcf_policy == 2){
+      int shares;
+      if(g->total_ticks == 0)
+        shares = g->io_ticks > 0 ? BOOSTED_SHARES : DEFAULT_SHARES;
+      else
+        // io/cpu >= ratio, multiplied out to avoid division (Section 4.1.6).
+        shares = g->io_ticks >= (uint64)SHARES_BOOSTING_RATIO * g->total_ticks ?
+                 BOOSTED_SHARES : DEFAULT_SHARES;
+      // Weight changes affect future charges only; history is preserved.
       g->vruntime_rem = g->vruntime_rem * shares / g->shares;
       g->shares = shares;
     }
+    // Section 4.1.6: a group with no RUNNABLE/RUNNING process drops its I/O
+    // history after this interval's decision. Resetting only here, not on
+    // every tick, lets a group whose members are all sleeping accumulate the
+    // I/O that should earn its boost.
+    if(g->run_procs == 0)
+      g->io_ticks = 0;
     release(&g->lock);
   }
 }
@@ -1043,8 +1056,16 @@ schedlog_emit(struct proc *selected)
         acquire(&group[id].lock);
         int shares = group[id].shares;
         uint64 vruntime = group[id].vruntime;
+        // Forum clarification (2026-11-10): print vruntime to two decimal
+        // places, truncated. The exact fractional part is
+        // (vruntime_frac + vruntime_rem / shares) / VRUNTIME_SCALE; flooring
+        // rem*100/shares first cannot change the result, so this is exact.
+        uint64 hundredths = (group[id].vruntime_frac * 100 +
+                             group[id].vruntime_rem * 100 / shares) / VRUNTIME_SCALE;
         release(&group[id].lock);
-        printf("%u|GROUP|%d(%d,%lu)", now, id, shares, vruntime);
+        // xv6 printf has no zero padding, so print both digits.
+        printf("%u|GROUP|%d(%d,%lu.%lu%lu)", now, id, shares, vruntime,
+               hundredths / 10, hundredths % 10);
       } else {
         printf("%u|STCF|0(0,0)", now);
       }

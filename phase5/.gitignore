@@ -1,0 +1,43 @@
+# xv6 build products
+*~
+_*
+*.o
+*.d
+*.asm
+*.sym
+*.img
+vectors.S
+bootblock
+entryother
+initcode
+initcode.out
+kernelmemfs
+mkfs/mkfs
+kernel/kernel
+user/usys.S
+.gdbinit
+TAGS
+# Policy/TRACE rebuild stamps written by the Makefile.
+.policy-*
+
+# The xv6 "_*" rule above would otherwise hide the Python test package marker.
+!__init__.py
+
+# Local Python environments and caches (Section 4.3 setup).
+__pycache__/
+cs140-project1/
+.venv/
+venv/
+.uv-cache/
+.pip-cache/
+
+# Local verification scratch output. runner_logs/ and results/ are evidence
+# required by Sections 4.3.3-4.3.4 and are intentionally NOT ignored.
+verification/
+
+# Editor and OS metadata.
+*:Zone.Identifier
+*.swp
+.vscode/
+.idea/
+.DS_Store

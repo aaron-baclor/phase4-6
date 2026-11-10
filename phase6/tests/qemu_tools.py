@@ -11,7 +11,9 @@ POLICIES = ("RR", "STCF", "GROUP_STCF")
 N_GROUPS = int(re.search(r"#define N_GROUPS (\d+)", (ROOT / "kernel/stcf.h").read_text())[1])
 WORKLOADS = ("test_cpu", "test_io", "test_f_cpu", "test_f_io", "test_bg",
              "test_group_iso", "test_group_sh")
-HEADER = re.compile(r"^(\d+)\|(STCF|GROUP)\|(\d+)\((\d+),(\d+)\)(.*)$")
+# GROUP vruntime has exactly two decimals (forum clarification, 2026-11-10);
+# the STCF compatibility header stays 0(0,0).
+HEADER = re.compile(r"^(\d+)\|(STCF|GROUP)\|(\d+)\((\d+),(\d+(?:\.\d{2})?)\)(.*)$")
 ENTRY = re.compile(r",\[(\d+)\]([^:,]*):([1-5])\((\d+),(\d+)\)")
 # xv6 prints user strings a character at a time; kernel records can interrupt
 # them. Match complete kernel records anywhere, retaining the original log.
@@ -86,9 +88,12 @@ def frames(text, grouped):
         entries = list(ENTRY.finditer(tail))
         assert "".join(m.group(0) for m in entries) == tail, f"Malformed entries: {line}"
         assert policy == ("GROUP" if grouped else "STCF")
-        if not grouped:
+        if grouped:
+            assert re.fullmatch(r"\d+\.\d{2}", vruntime), f"vruntime needs two decimals: {line}"
+        else:
             assert (gid, shares, vruntime) == ("0", "0", "0")
-        row = (int(tick), int(gid), int(shares), int(vruntime),
+        # vruntime is kept in hundredths so comparisons stay exact integers.
+        row = (int(tick), int(gid), int(shares), int(vruntime.replace(".", "")),
                [(int(m[1]), m[2], int(m[3]), int(m[4]), int(m[5])) for m in entries])
         current.append(row)
         if not grouped or int(gid) == N_GROUPS - 1:
